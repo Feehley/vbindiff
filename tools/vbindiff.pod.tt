@@ -32,7 +32,7 @@ vbindiff - hexadecimal file display and comparison
 
 =head1 SYNOPSIS
 
-B<vbindiff> I<file1> [ I<file2> ]
+B<vbindiff> [I<options>] I<file1> [ I<file2> ]
 
 =head1 DESCRIPTION
 
@@ -45,8 +45,8 @@ large files (up to 4 GB).
 
  Movement Keys
  -------------
- Up      Move one line (16 bytes) towards the beginning of the file
- Down    Move one line (16 bytes) towards the end of the file
+ Up      Move one line (16 bytes by default; see -w) towards the beginning of the file
+ Down    Move one line (16 bytes by default; see -w) towards the end of the file
  Left    Move one byte towards the beginning of the file
  Right   Move one byte towards the end of the file
  PageUp  Move one page towards the beginning of the file
@@ -125,9 +125,49 @@ Also, you cannot insert or delete bytes, only change them.
 
 =head1 OPTIONS
 
- -L, --license   Display license information for vbindiff
- -V, --version   Display the version number
-     --help      Display help information
+ -L, --license          Display license information for vbindiff
+ -V, --version          Display the version number
+     --help             Display help information
+ -s, --side-by-side     Show files side by side instead of stacked
+ -w, --width=N          Bytes shown per line (default 16)
+ -c, --config=FILE      Load a color scheme from FILE
+
+=head2 Side by side mode
+
+By default, VBinDiff stacks the two files one above the other, as in
+earlier versions.  Passing C<-s> instead shows them side by side, left
+and right, separated by a colored divider.
+
+Side by side mode needs a wider terminal, since both files' hex/ASCII
+columns must fit on screen at once.  Use C<-w> to show fewer bytes per
+line if your terminal isn't wide enough; VBinDiff will report the
+required width if the terminal is too narrow for the requested
+combination of C<-s> and C<-w>.
+
+C<-w> also works without C<-s>, changing how many bytes are shown per
+line in the normal stacked display.
+
+=head2 Color configuration
+
+VBinDiff's colors can be customized with a simple text config file,
+loaded with C<-c> I<FILE>, or automatically from C<~/.vbindiffrc> if
+that file exists and no C<-c> option is given.
+
+Each line has the form:
+
+ styleName = foreground/background[/bold|reverse|underline]
+
+Valid style names: C<background>, C<promptWin>, C<promptKey>,
+C<promptBdr>, C<currentMode>, C<fileName>, C<fileWin>, C<fileDiff>,
+C<fileEdit>, C<divider>.
+
+Valid colors: C<black>, C<red>, C<green>, C<yellow>, C<blue>,
+C<magenta>, C<cyan>, C<white>.
+
+Blank lines and lines starting with C<#> are ignored.  For example:
+
+ fileDiff = green/black/bold
+ divider  = magenta/black/bold
 
 =head1 BUGS
 

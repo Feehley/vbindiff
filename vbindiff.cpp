@@ -115,13 +115,15 @@ const Command  cmToggleASCII  = 12;
 const Command  cmFind         = 16; // Commands 16-19
 
 const short  leftMar  = 11;     // Starting column of hex display
-const short  leftMar2 = 61;     // Starting column of ASCII display
+short        leftMar2 = 61;     // Starting column of ASCII display (computed)
 
-const int  lineWidth = 16;      // Number of bytes displayed per line
+int  lineWidth = 16;            // Number of bytes displayed per line (-w)
 
 const int  promptHeight = 4;    // Height of prompt window
 const int  inWidth = 10;        // Width of input window (excluding border)
-const int  screenWidth = 80;
+const int  paneGap = 3;         // Columns of divider between side-by-side panes
+int  paneWidth   = 77;          // Width of a single file pane (computed)
+int  screenWidth = 155;         // Total width required (computed)
 
 const int  maxPath = 260;
 
@@ -139,11 +141,10 @@ void showPrompt();
 
 class Difference;
 
-union FileBuffer
-{
-  Byte  line[1][lineWidth];
-  Byte  buffer[lineWidth];
-}; // end FileBuffer
+// A file's buffer is a flat array of `bufSize` bytes, addressed as
+// bufSize = numLines * lineWidth.  Since lineWidth is now chosen at
+// runtime (see --width), we can't use a compile-time-sized 2D array,
+// so row/column access is done as data[row*lineWidth + col].
 
 class FileDisplay
 {
@@ -151,24 +152,25 @@ class FileDisplay
 
  protected:
   int                bufContents;
-  FileBuffer*        data;
+  Byte*               data;
   const Difference*  diffs;
   File               file;
   char               fileName[maxPath];
   FPos               offset;
   ConWindow          win;
   bool               writable;
+  int                xPos;
   int                yPos;
  public:
   FileDisplay();
   ~FileDisplay();
-  void         init(int y, const Difference* aDiff=NULL,
+  void         init(int x, int y, const Difference* aDiff=NULL,
                     const char* aFileName=NULL);
   void         resize();
   void         shutDown();
   void         display();
   bool         edit(const FileDisplay* other);
-  const Byte*  getBuffer() const { return data->buffer; };
+  const Byte*  getBuffer() const { return data; };
   void         move(int step)    { moveTo(offset + step); };
   void         moveTo(FPos newOffset);
   bool         moveTo(const Byte* searchFor, int searchLen);
@@ -183,7 +185,7 @@ class Difference
   friend void FileDisplay::display();
 
  protected:
-  FileBuffer*         data;
+  Byte*                data;
   const FileDisplay*  file1;
   const FileDisplay*  file2;
   int                 numDiffs;
@@ -227,17 +229,21 @@ class InputManager
 
 String       lastSearch;
 StrVec       hexSearchHistory, textSearchHistory, positionHistory;
-ConWindow    promptWin,inWin;
+ConWindow    promptWin,inWin,dividerWin;
 FileDisplay  file1, file2;
 Difference   diffs(&file1, &file2);
 const char*  displayTable = asciiDisplayTable;
 const char*  program_name; // Name under which this program was invoked
 LockState    lockState = lockNeither;
 bool         singleFile = false;
+bool         sideBySide = false;  // -s/--side-by-side
+
+long         optLineWidth = 16;   // -w/--width
+const char*  optConfigPath = NULL; // -c/--config
 
 int  numLines  = 9;       // Number of lines of each file to display
 int  bufSize   = numLines * lineWidth;
-int  linesBetween = 1;    // Number of lines of padding between files
+int  linesBetween = 1;    // Number of lines of padding between files (stacked mode)
 
 // The number of bytes to move for each possible step size:
 //   See cmmMoveByte, cmmMoveLine, cmmMovePage
@@ -317,19 +323,19 @@ int Difference::compute()
     // We return 1 so that cmNextDiff won't keep searching:
     return (file1->bufContents ? 1 : -1);
 
-  memset(data->buffer, 0, bufSize); // Clear the difference table
+  memset(data, 0, bufSize); // Clear the difference table
 
   int  different = 0;
 
-  const Byte*  buf1 = file1->data->buffer;
-  const Byte*  buf2 = file2->data->buffer;
+  const Byte*  buf1 = file1->data;
+  const Byte*  buf2 = file2->data;
 
   int  size = min(file1->bufContents, file2->bufContents);
 
   int  i;
   for (i = 0; i < size; i++)
     if (*(buf1++) != *(buf2++)) {
-      data->buffer[i] = true;
+      data[i] = true;
       ++different;
     }
 
@@ -339,7 +345,7 @@ int Difference::compute()
     // One buffer has more data than the other:
     different += size - i;
     for (; i < size; i++)
-      data->buffer[i] = true;   // These bytes are only in 1 buffer
+      data[i] = true;   // These bytes are only in 1 buffer
   } else if (!size)
     return -1;                  // Both buffers are empty
 
@@ -356,7 +362,7 @@ void Difference::resize()
   if (data)
     delete [] reinterpret_cast<Byte*>(data);
 
-  data = reinterpret_cast<FileBuffer*>(new Byte[bufSize]);
+  data = new Byte[bufSize];
 } // end Difference::resize
 
 //====================================================================
@@ -389,6 +395,7 @@ FileDisplay::FileDisplay()
   diffs(NULL),
   offset(0),
   writable(false),
+  xPos(0),
   yPos(0)
 {
   fileName[0] = '\0';
@@ -404,13 +411,15 @@ FileDisplay::FileDisplay()
 //   aDiff:      The Difference object related to this buffer
 //   aFileName:  The name of the file to display
 
-void FileDisplay::init(int y, const Difference* aDiff,
+void FileDisplay::init(int x, int y, const Difference* aDiff,
                        const char* aFileName)
 {
   diffs = aDiff;
+  xPos  = x;
   yPos  = y;
 
-  win.init(0,y, screenWidth, (numLines + 1 + ((y==0) ? linesBetween : 0)),
+  win.init(x, y, paneWidth,
+           numLines + 1 + ((y==0 && !sideBySide) ? linesBetween : 0),
            cFileWin);
 
   resize();
@@ -435,7 +444,7 @@ void FileDisplay::resize()
   if (data)
     delete [] reinterpret_cast<Byte*>(data);
 
-  data = reinterpret_cast<FileBuffer*>(new Byte[bufSize]);
+  data = new Byte[bufSize];
 
   // FIXME resize window
 } // end FileDisplay::resize
@@ -460,17 +469,18 @@ void FileDisplay::display()
   FPos  lineOffset = offset;
 
   short i,j,index,lineLength;
-  char  buf[lineWidth + lineWidth/8 + 1];
-  buf[sizeof(buf)-1] = '\0';
+  const int hexGroups = (lineWidth + 7) / 8;
 
-  char  buf2[screenWidth+1];
-  buf2[screenWidth] = '\0';
+  vector<char>  buf(lineWidth + hexGroups + 1);
+  buf[buf.size()-1] = '\0';
 
-  memset(buf, ' ', sizeof(buf)-1);
+  vector<char>  buf2(paneWidth + 1);
+  buf2[paneWidth] = '\0';
+
+  memset(&buf[0], ' ', buf.size()-1);
 
   for (i = 0; i < numLines; i++) {
-//    cerr << i << '\n';
-    char*  str = buf2;
+    char*  str = &buf2[0];
     str +=
       sprintf(str, "%04X %04X:",Word(lineOffset>>16),Word(lineOffset&0xFFFF));
 
@@ -481,22 +491,22 @@ void FileDisplay::display()
         *(str++) = ' ';
         ++index;
       }
-      str += sprintf(str, "%02X ", data->line[i][j]);
+      str += sprintf(str, "%02X ", data[(i)*lineWidth+(j)]);
 
-      buf[index++] = displayTable[data->line[i][j]];
+      buf[index++] = displayTable[data[(i)*lineWidth+(j)]];
     }
     if (index < 0) index = 0; // in case nothing was printed in this line
-    memset(buf + index, ' ', sizeof(buf) - index - 1);
-    memset(str, ' ', screenWidth - (str - buf2));
+    memset(&buf[0] + index, ' ', buf.size() - index - 1);
+    memset(str, ' ', paneWidth - (str - &buf2[0]));
 
-    win.put(0,i+1, buf2);
-    win.put(leftMar2,i+1, buf);
+    win.put(0,i+1, &buf2[0]);
+    win.put(leftMar2,i+1, &buf[0]);
 
     if (diffs)
       for (j = 0; j < lineWidth; j++)
-        if (diffs->data->line[i][j]) {
-          win.putAttribs(j*3 + leftMar  + (j>7),i+1, cFileDiff,2);
-          win.putAttribs(j   + leftMar2 + (j>7),i+1, cFileDiff,1);
+        if (diffs->data[(i)*lineWidth+(j)]) {
+          win.putAttribs(j*3 + leftMar  + (j/8),i+1, cFileDiff,2);
+          win.putAttribs(j   + leftMar2 + (j/8),i+1, cFileDiff,1);
         }
     lineOffset += lineWidth;
   } // end for i up to numLines
@@ -525,7 +535,7 @@ bool FileDisplay::edit(const FileDisplay* other)
   }
 
   if (bufContents < bufSize)
-    memset(data->buffer + bufContents, 0, bufSize - bufContents);
+    memset(data + bufContents, 0, bufSize - bufContents);
 
   short x = 0;
   short y = 0;
@@ -572,7 +582,7 @@ bool FileDisplay::edit(const FileDisplay* other)
        short newByte = -1;
        if ((key == KEY_RETURN) && other &&
            (other->bufContents > x + y*lineWidth)) {
-         newByte = other->data->line[y][x]; // Copy from other file
+         newByte = other->data[(y)*lineWidth+(x)]; // Copy from other file
          hiNib = ascii; // Always advance cursor to next byte
        } else if (ascii) {
          if (isprint(key)) newByte = (inputTable ? inputTable[key] : key);
@@ -583,9 +593,9 @@ bool FileDisplay::edit(const FileDisplay* other)
            newByte = safeUC(key) - 'A' + 10;
          if (newByte >= 0) {
            if (hiNib)
-             newByte = (newByte * 0x10) | (0x0F & data->line[y][x]);
+             newByte = (newByte * 0x10) | (0x0F & data[(y)*lineWidth+(x)]);
            else
-             newByte |= 0xF0 & data->line[y][x];
+             newByte |= 0xF0 & data[(y)*lineWidth+(x)];
          } // end if valid digit entered
        } // end else hex
        if (newByte >= 0) {
@@ -623,7 +633,7 @@ bool FileDisplay::edit(const FileDisplay* other)
       moveTo(offset);           // Re-read buffer contents
     } else {
       SeekFile(file, offset);
-      WriteFile(file, data->buffer, bufContents);
+      WriteFile(file, data, bufContents);
     }
   }
   showPrompt();
@@ -650,11 +660,11 @@ void FileDisplay::setByte(short x, short y, Byte b)
     } // end if more than 1 byte past the end
    done:
     ++bufContents;
-    data->line[y][x] = b ^ 1;         // Make sure it's different
+    data[(y)*lineWidth+(x)] = b ^ 1;         // Make sure it's different
   } // end if past the end
 
-  if (data->line[y][x] != b) {
-    data->line[y][x] = b;
+  if (data[(y)*lineWidth+(x)] != b) {
+    data[(y)*lineWidth+(x)] = b;
     char str[3];
     sprintf(str, "%02X", b);
     win.setAttribs(cFileEdit);
@@ -700,7 +710,7 @@ void FileDisplay::moveTo(FPos newOffset)
     offset = 0;
 
   SeekFile(file, offset);
-  bufContents = ReadFile(file, data->buffer, bufSize);
+  bufContents = ReadFile(file, data, bufSize);
 } // end FileDisplay::moveTo
 
 //--------------------------------------------------------------------
@@ -835,7 +845,7 @@ bool FileDisplay::setFile(const char* aFileName)
   fileName[maxPath-1] = '\0';
 
   win.put(0,0, fileName);
-  win.putAttribs(0,0, cFileName, screenWidth);
+  win.putAttribs(0,0, cFileName, paneWidth);
   win.update();                 // FIXME
 
   bufContents = 0;
@@ -846,7 +856,7 @@ bool FileDisplay::setFile(const char* aFileName)
     return false;
 
   offset = 0;
-  bufContents = ReadFile(file, data->buffer, bufSize);
+  bufContents = ReadFile(file, data, bufSize);
 
   return true;
 } // end FileDisplay::setFile
@@ -854,16 +864,41 @@ bool FileDisplay::setFile(const char* aFileName)
 //====================================================================
 // Main Program:
 //--------------------------------------------------------------------
+// Compute leftMar2/paneWidth/screenWidth from the current lineWidth:
+//
+// Layout of one pane's content, e.g. for lineWidth=16:
+//   "OOOO OOOO: HH HH HH HH HH HH HH HH  HH HH HH HH HH HH HH HH  AAAAAAAAAAAAAAAA"
+//    <--10---->                <---- hex: 3*lineWidth + groups ---------------->  <-- ascii: lineWidth -->
+
+void computeLayoutMetrics()
+{
+  const int offsetFieldWidth = 10;                 // "OOOO OOOO:"
+  const int hexGroups = (lineWidth + 7) / 8;        // extra space per 8-byte group
+
+  leftMar2  = offsetFieldWidth + hexGroups + lineWidth * 3;
+  paneWidth = leftMar2 + lineWidth;
+
+  screenWidth = (singleFile || !sideBySide) ? paneWidth
+                                             : (paneWidth * 2 + paneGap);
+} // end computeLayoutMetrics
+
+//--------------------------------------------------------------------
 void calcScreenLayout(bool resize = true)
 {
+  computeLayoutMetrics();
+
   int  screenX, screenY;
 
   ConWindow::getScreenSize(screenX, screenY);
 
   if (screenX < screenWidth) {
     ostringstream  err;
-    err << "The screen must be at least "
-        << screenWidth << " characters wide.";
+    err << "The screen must be at least " << screenWidth
+        << " characters wide to show " << lineWidth
+        << " bytes/line" << ((!singleFile && sideBySide) ? " side by side" : "")
+        << ".\n"
+        << "Use -w/--width to show fewer bytes per line, or widen "
+        << "your terminal.";
     exitMsg(2, err.str().c_str());
   }
 
@@ -874,11 +909,14 @@ void calcScreenLayout(bool resize = true)
     exitMsg(2, err.str().c_str());
   }
 
-  numLines = screenY - promptHeight - (singleFile ? 1 : 2);
-
-  if (singleFile)
+  if (singleFile || sideBySide) {
+    // Single pane, or side-by-side panes sharing the same rows:
+    // only 1 row is needed for the filename header, not 2.
+    numLines = screenY - promptHeight - 1;
     linesBetween = 0;
-  else {
+  } else {
+    // Stacked (original) layout: two panes, one above the other.
+    numLines = screenY - promptHeight - 2;
     linesBetween = numLines % 2;
     numLines = (numLines - linesBetween) / 2;
   }
@@ -1278,12 +1316,32 @@ int packHex(Byte* buf)
 void positionInWin(Command cmd, short width, const char* title)
 {
   inWin.resize(width, 3);
-  inWin.move((screenWidth-width)/2,
-             ((!singleFile && (cmd & cmgGotoBottom))
-              ? ((cmd & cmgGotoTop)
-                 ? numLines + linesBetween                   // Moving both
-                 : numLines + numLines/2 + 1 + linesBetween) // Moving bottom
-              : numLines/2));                                // Moving top
+
+  if (sideBySide) {
+    const bool wantTop    = singleFile || (cmd & cmgGotoTop);
+    const bool wantBottom = !singleFile && (cmd & cmgGotoBottom);
+
+    short paneX, paneAvailWidth;
+
+    if (wantTop && wantBottom) {
+      paneX = 0;  paneAvailWidth = screenWidth;                  // Span both panes
+    } else if (wantBottom) {
+      paneX = paneWidth + paneGap;  paneAvailWidth = paneWidth;  // Right pane only
+    } else {
+      paneX = 0;  paneAvailWidth = paneWidth;                    // Left pane only
+    }
+
+    inWin.move(paneX + (paneAvailWidth-width)/2, numLines/2);
+  } else {
+    // Stacked (original) layout: position vertically over the top or
+    // bottom file's rows, horizontally centered across the full screen.
+    inWin.move((screenWidth-width)/2,
+               ((!singleFile && (cmd & cmgGotoBottom))
+                ? ((cmd & cmgGotoTop)
+                   ? numLines + linesBetween                   // Moving both
+                   : numLines + numLines/2 + 1 + linesBetween) // Moving bottom
+                : numLines/2));                                // Moving top
+  }
 
   inWin.border();
   inWin.put((width-strlen(title))/2,0, title);
@@ -1381,17 +1439,28 @@ bool initialize()
   inWin.hide();
 
   int y;
-  if (singleFile) y = numLines + 1;
-  else            y = numLines * 2 + linesBetween + 2;
+  if (singleFile || sideBySide) y = numLines + 1;
+  else                          y = numLines * 2 + linesBetween + 2;
 
   promptWin.init(0,y, screenWidth,promptHeight, cBackground);
   showPrompt();
 
   if (!singleFile) diffs.resize();
 
-  file1.init(0, (singleFile ? NULL : &diffs));
+  file1.init(0, 0, (singleFile ? NULL : &diffs));
 
-  if (!singleFile) file2.init(numLines + linesBetween + 1, &diffs);
+  if (!singleFile) {
+    if (sideBySide) {
+      file2.init(paneWidth + paneGap, 0, &diffs);
+
+      // Draw a divider between the two side-by-side panes:
+      dividerWin.init(paneWidth, 0, paneGap, numLines + 1, cDivider);
+      for (int row = 0; row <= numLines; ++row)
+        dividerWin.putChar(paneGap/2, row, '|', 1);
+      dividerWin.update();
+    } else
+      file2.init(0, numLines + linesBetween + 1, &diffs);
+  }
 
   return true;
 } // end initialize
@@ -1769,7 +1838,10 @@ If FILE2 is omitted, just display FILE1.\n\
 Options:\n\
       --help               display this help information and exit\n\
       -L, --license        display license & warranty information and exit\n\
-      -V, --version        display version information and exit\n";
+      -V, --version        display version information and exit\n\
+      -s, --side-by-side   show files side by side instead of stacked\n\
+      -w, --width=N        bytes per line in side-by-side mode (default 16)\n\
+      -c, --config=FILE    load color scheme from FILE\n";
   }
 
   exit(exitStatus);
@@ -1781,6 +1853,15 @@ bool usage(GetOpt* getopt, const GetOpt::Option* option,
   usage(option->shortName == '?');
   return false;                 // Never happens
 } // end usage
+
+//--------------------------------------------------------------------
+bool setSideBySide(GetOpt*, const GetOpt::Option*, const char*,
+                    GetOpt::Connection, const char*, int*)
+{
+  sideBySide = true;
+  return false;    // This option never takes an argument; returning false
+                    // tells GetOpt not to consume the next positional arg.
+} // end setSideBySide
 
 //--------------------------------------------------------------------
 // Handle options:
@@ -1800,6 +1881,11 @@ void processOptions(int& argc, char**& argv)
     { '?', "help",       NULL, 0, &usage },
     { 'L', "license",    NULL, 0, &license },
     { 'V', "version",    NULL, 0, &usage },
+    { 's', "side-by-side", NULL, 0, &setSideBySide },
+    { 'w', "width",       NULL, GetOpt::needArg, &GetOpt::isLong,
+      &optLineWidth },
+    { 'c', "config",      NULL, GetOpt::needArg, &GetOpt::isString,
+      &optConfigPath },
     { 0 }
   };
 
@@ -1814,6 +1900,13 @@ void processOptions(int& argc, char**& argv)
     argc -= --argi;     // Reduce argc by number of arguments used
     argv += argi;       // And adjust argv[1] to the next argument
   }
+
+  if (optLineWidth < 4 || optLineWidth > 64) {
+    cerr << program_name
+         << ": --width must be between 4 and 64 bytes per line\n";
+    exit(1);
+  }
+  lineWidth = int(optLineWidth);
 } // end processOptions
 
 //====================================================================
@@ -1837,6 +1930,23 @@ VBinDiff " PACKAGE_VERSION ", Copyright 1995-2017 Christopher J. Madsen\n\
 VBinDiff comes with ABSOLUTELY NO WARRANTY; for details type `vbindiff -L'.\n";
 
   singleFile = (argc == 2);
+
+  {
+    string configErr;
+    if (optConfigPath)
+      configErr = ConWindow::loadColorConfig(optConfigPath, false);
+    else {
+      const char* home = getenv("HOME");
+      if (home)
+        configErr = ConWindow::loadColorConfig(
+          (string(home) + "/.vbindiffrc").c_str(), true);
+    }
+    if (!configErr.empty()) {
+      cerr << program_name << ": " << configErr << '\n';
+      return 1;
+    }
+  }
+
   if (!initialize()) {
     cerr << '\n' << program_name << ": Unable to initialize windows\n";
     return 1;
@@ -1870,6 +1980,7 @@ VBinDiff comes with ABSOLUTELY NO WARRANTY; for details type `vbindiff -L'.\n";
   file1.shutDown();
   file2.shutDown();
   inWin.close();
+  dividerWin.close();
   promptWin.close();
 
   ConWindow::shutdown();

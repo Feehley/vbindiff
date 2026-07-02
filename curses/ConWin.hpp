@@ -24,6 +24,7 @@
 #define INCLUDED_CONWIN_HPP
 
 #include <panel.h>
+#include <string>
 #undef border                 // It interferes with my member function
 
 #define KEY_ESCAPE 0x1B
@@ -40,7 +41,9 @@ enum Style {
   cFileName,
   cFileWin,
   cFileDiff,
-  cFileEdit
+  cFileEdit,
+  cDivider,
+  cNumStyles                    // Must be last
 };
 
 class ConWindow
@@ -76,6 +79,11 @@ class ConWindow
   static void showCursor(bool insert=true)  { curs_set(insert ? 1 : 2); };
   static void shutdown();
   static bool startup();
+
+  // Load a color scheme from a config file (see ConWin.cpp for format).
+  // Returns "" on success, or an error message on failure.
+  // If `optional` is true, a missing file is not an error.
+  static std::string loadColorConfig(const char* path, bool optional);
 }; // end ConWindow
 
 #endif // INCLUDED_CONWIN_HPP

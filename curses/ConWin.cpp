@@ -20,41 +20,205 @@
 //--------------------------------------------------------------------
 
 #include <stdlib.h>
+#include <stdio.h>
+#include <string.h>
+
+#include <fstream>
+#include <map>
+#include <sstream>
+#include <string>
+#include <vector>
+using namespace std;
 
 #include "ConWin.hpp"
 
 void exitMsg(int status, const char* message); // From vbindiff.cpp
 
-enum ColorPair {
-  pairWhiteBlue= 1,
-  pairWhiteBlack,
-  pairRedBlue,
-  pairYellowBlue
+//--------------------------------------------------------------------
+// Default ("modernized") color scheme:
+//
+// Each Style gets its own foreground, background, and extra attributes
+// (currently just A_BOLD).  This can be overridden at runtime with
+// ConWindow::loadColorConfig() -- see that function for the file format.
+
+struct StyleColor { short fg, bg; attr_t attrs; };
+
+static StyleColor styleColor[cNumStyles] = {
+  { COLOR_WHITE,  COLOR_BLUE,  0         },  // cBackground
+  { COLOR_WHITE,  COLOR_BLUE,  0         },  // cPromptWin
+  { COLOR_WHITE,  COLOR_BLUE,  A_BOLD    },  // cPromptKey
+  { COLOR_WHITE,  COLOR_BLUE,  A_BOLD    },  // cPromptBdr
+  { COLOR_WHITE,  COLOR_BLACK, A_REVERSE },  // cCurrentMode
+  { COLOR_WHITE,  COLOR_BLACK, A_REVERSE },  // cFileName
+  { COLOR_WHITE,  COLOR_BLUE,  0         },  // cFileWin
+  { COLOR_RED,    COLOR_BLUE,  A_BOLD    },  // cFileDiff
+  { COLOR_YELLOW, COLOR_BLUE,  A_BOLD    },  // cFileEdit
+  { COLOR_WHITE,  COLOR_BLUE,  A_BOLD    },  // cDivider (new in this fork; matches original border style)
 };
 
-static const ColorPair colorStyle[] = {
-  pairWhiteBlue,   // cBackground
-  pairWhiteBlue,   // cPromptWin
-  pairWhiteBlue,   // cPromptKey
-  pairWhiteBlue,   // cPromptBdr
-  pairWhiteBlack,  // cCurrentMode
-  pairWhiteBlack,  // cFileName
-  pairWhiteBlue,   // cFileWin
-  pairRedBlue,     // cFileDiff
-  pairYellowBlue   // cFileEdit
+static const char* const styleName[cNumStyles] = {
+  "background",
+  "promptWin",
+  "promptKey",
+  "promptBdr",
+  "currentMode",
+  "fileName",
+  "fileWin",
+  "fileDiff",
+  "fileEdit",
+  "divider",
 };
 
-static const attr_t attribStyle[] = {
-              COLOR_PAIR(colorStyle[ cBackground ]),
-              COLOR_PAIR(colorStyle[ cPromptWin  ]),
-  A_BOLD    | COLOR_PAIR(colorStyle[ cPromptKey  ]),
-  A_BOLD    | COLOR_PAIR(colorStyle[ cPromptBdr  ]),
-  A_REVERSE | COLOR_PAIR(colorStyle[ cCurrentMode]),
-  A_REVERSE | COLOR_PAIR(colorStyle[ cFileName   ]),
-              COLOR_PAIR(colorStyle[ cFileWin    ]),
-  A_BOLD    | COLOR_PAIR(colorStyle[ cFileDiff   ]),
-  A_BOLD    | COLOR_PAIR(colorStyle[ cFileEdit   ])
-};
+static attr_t attribStyle[cNumStyles];
+static short  pairOf[cNumStyles];     // curses color-pair number per style, 0 = none
+
+//--------------------------------------------------------------------
+// Parse a color name (case-insensitive) into a curses COLOR_* value.
+// Returns true and sets `color` on success.
+
+static bool parseColorName(const string& name, short& color)
+{
+  static const struct { const char* name; short color; } table[] = {
+    { "black",   COLOR_BLACK   },
+    { "red",     COLOR_RED     },
+    { "green",   COLOR_GREEN   },
+    { "yellow",  COLOR_YELLOW  },
+    { "blue",    COLOR_BLUE    },
+    { "magenta", COLOR_MAGENTA },
+    { "cyan",    COLOR_CYAN    },
+    { "white",   COLOR_WHITE   },
+    { NULL, 0 }
+  };
+
+  string lower(name);
+  for (string::size_type i = 0; i < lower.size(); ++i)
+    lower[i] = tolower(static_cast<unsigned char>(lower[i]));
+
+  for (int i = 0; table[i].name; ++i)
+    if (lower == table[i].name) {
+      color = table[i].color;
+      return true;
+    }
+
+  return false;
+} // end parseColorName
+
+//--------------------------------------------------------------------
+// Load a color scheme from a config file.
+//
+// File format (one style per line, blank lines and lines starting with
+// '#' are ignored):
+//
+//   styleName = foreground/background[/bold]
+//
+// Valid styleNames: background, promptWin, promptKey, promptBdr,
+//   currentMode, fileName, fileWin, fileDiff, fileEdit, divider
+// Valid colors: black, red, green, yellow, blue, magenta, cyan, white
+//
+// Example:
+//   fileDiff = red/black/bold
+//   fileEdit = yellow/black/bold
+//
+// Must be called before ConWindow::startup().
+
+string ConWindow::loadColorConfig(const char* path, bool optional)
+{
+  ifstream in(path);
+  if (!in) {
+    if (optional) return "";
+    return string("Unable to open color config file: ") + path;
+  }
+
+  map<string,int> nameToIndex;
+  for (int i = 0; i < cNumStyles; ++i)
+    nameToIndex[styleName[i]] = i;
+
+  string line;
+  int lineNum = 0;
+  while (getline(in, line)) {
+    ++lineNum;
+
+    // Strip comments & whitespace:
+    string::size_type hash = line.find('#');
+    if (hash != string::npos) line.erase(hash);
+
+    string::size_type start = line.find_first_not_of(" \t\r\n");
+    if (start == string::npos) continue;    // blank line
+    string::size_type end = line.find_last_not_of(" \t\r\n");
+    line = line.substr(start, end - start + 1);
+    if (line.empty()) continue;
+
+    string::size_type eq = line.find('=');
+    if (eq == string::npos) {
+      ostringstream err;
+      err << path << ':' << lineNum << ": expected 'name = fg/bg'";
+      return err.str();
+    }
+
+    string name = line.substr(0, eq);
+    string value = line.substr(eq+1);
+
+    string::size_type nEnd = name.find_last_not_of(" \t");
+    name = name.substr(0, nEnd+1);
+    string::size_type vStart = value.find_first_not_of(" \t");
+    if (vStart != string::npos) value = value.substr(vStart);
+
+    map<string,int>::iterator it = nameToIndex.find(name);
+    if (it == nameToIndex.end()) {
+      ostringstream err;
+      err << path << ':' << lineNum << ": unknown style name '" << name
+          << "'";
+      return err.str();
+    }
+
+    // Split value on '/':
+    vector<string> parts;
+    string::size_type pos = 0;
+    while (true) {
+      string::size_type slash = value.find('/', pos);
+      parts.push_back(value.substr(pos, slash - pos));
+      if (slash == string::npos) break;
+      pos = slash + 1;
+    }
+
+    if (parts.size() < 2) {
+      ostringstream err;
+      err << path << ':' << lineNum
+          << ": expected 'foreground/background[/bold]'";
+      return err.str();
+    }
+
+    short fg, bg;
+    if (!parseColorName(parts[0], fg) || !parseColorName(parts[1], bg)) {
+      ostringstream err;
+      err << path << ':' << lineNum << ": unrecognized color name";
+      return err.str();
+    }
+
+    attr_t attrs = 0;
+    for (size_t i = 2; i < parts.size(); ++i) {
+      string opt(parts[i]);
+      for (string::size_type j = 0; j < opt.size(); ++j)
+        opt[j] = tolower(static_cast<unsigned char>(opt[j]));
+      if (opt == "bold")         attrs |= A_BOLD;
+      else if (opt == "reverse") attrs |= A_REVERSE;
+      else if (opt == "underline") attrs |= A_UNDERLINE;
+      else {
+        ostringstream err;
+        err << path << ':' << lineNum << ": unrecognized attribute '"
+            << parts[i] << "'";
+        return err.str();
+      }
+    }
+
+    int idx = it->second;
+    styleColor[idx].fg    = fg;
+    styleColor[idx].bg    = bg;
+    styleColor[idx].attrs = attrs;
+  } // end while getline
+
+  return "";
+} // end ConWindow::loadColorConfig
 
 //====================================================================
 // Class ConWindow:
@@ -83,10 +247,18 @@ bool ConWindow::startup()
   if (has_colors()) {
     start_color();
 
-    init_pair(pairWhiteBlue,  COLOR_WHITE,  COLOR_BLUE);
-    init_pair(pairWhiteBlack, COLOR_WHITE,  COLOR_BLACK);
-    init_pair(pairRedBlue,    COLOR_RED,    COLOR_BLUE);
-    init_pair(pairYellowBlue, COLOR_YELLOW, COLOR_BLUE);
+    for (int i = 0; i < cNumStyles; ++i) {
+      short pair = short(i + 1);
+      init_pair(pair, styleColor[i].fg, styleColor[i].bg);
+      pairOf[i]      = pair;
+      attribStyle[i] = styleColor[i].attrs | COLOR_PAIR(pair);
+    }
+  } else {
+    // No color support: fall back to plain attributes only:
+    for (int i = 0; i < cNumStyles; ++i) {
+      pairOf[i]      = 0;
+      attribStyle[i] = styleColor[i].attrs;
+    }
   } // end if terminal has color
 
   return true;
@@ -197,7 +369,7 @@ void ConWindow::close()
 
 void ConWindow::putAttribs(short x, short y, Style color, short count)
 {
-  mvwchgat(win, y, x, count, attribStyle[color], colorStyle[color], NULL);
+  mvwchgat(win, y, x, count, attribStyle[color], pairOf[color], NULL);
   touchwin(win);
 } // end ConWindow::putAttribs
 
